@@ -43,12 +43,21 @@ class ManilaPluginRequires(reactive.RelationBase):
 
     @reactive.hook('{requires:manila-plugin}-relation-joined')
     def joined(self):
+        """At least one manila-plugin has joined. Thus we set the connected
+        state to allow the consumer to start setting authentication data.
+
+        We also update the status, as this may or may not be another plugin.
+        """
         hookenv.log("ManilaPlugin (principal): joined", level=hookenv.DEBUG)
         self.set_state('{relation_name}.connected')
         self.update_status()
 
     @reactive.hook('{requires:manila-plugin}-relation-changed')
     def changed(self):
+        """Something has changed in one of the plugins, so we use update_status
+        to update the relation states to allow the consumer of the interface to
+        update any structures that it needs.
+        """
         hookenv.log("ManilaPlugin (principal): changed", level=hookenv.DEBUG)
         self.update_status()
 
@@ -56,54 +65,68 @@ class ManilaPluginRequires(reactive.RelationBase):
     def departed(self):
         hookenv.log("ManilaPlugin (principal): broken, departed",
                     level=hookenv.DEBUG)
-        self.remove_state('{relation_name}.connected')
-        self.remove_state('{relation_name}.available')
-        self.remove_state('{relation_name}.changed')
+        self.update_status()
 
     def update_status(self):
-        """Set the .available and .changed state if both the plugin name and
-        the configuration data are available.
+        """Set the .available and .changed state if at least one of the
+        conversations (with the subordinate) has a name and some configuration
+        data (regardless of whether it is complete).
 
-        Note that the .changed state can be used if the plugin changes the
-        data. Thus, Manila can watched changed and then clear it using the
-        method clear_changed() to update configuration files as needed.
+        As there can be multiple conversations, it is up to the subordinate
+        charm to flag up problems with its juju status as the principal charm
+        deals with multiple backends.
+
+        Note that the .changed state can be used if a plugin changes the data.
+        Thus, Manila can watch changes and then clear it using the method
+        clear_changed() to update configuration files as needed.
 
         The interface will NOT set .changed without having .available at the
         same time.
         """
-        if self._name() is not None and self._configuration_data() is not None:
-            hookenv.log(
-                "ManilaPlugin (principal): have _name:{} and "
-                "_configuration data:{}"
-                .format(self._name(), self._configuration_data(),
-                        level=hookenv.DEBUG))
-            self.set_state('{relation_name}.available')
+        count_available = 0
+        count_changed = 0
+        for conversation in self.conversations():
+            # try to see if we've already had this conversation
+            conversation_available = self.get_local(
+                '_available', default=None, scope=conversation.scope)
+            name = self.get_remote(
+                '_name', default=None, scope=conversation.scope)
+            configuration_data = self.get_remote(
+                '_configuration_data',
+                default=None,
+                scope=conversation.scope)
+            if name is not None and configuration_data is not None:
+                hookenv.log(
+                    "ManilaPlugin (principal): have _name:{} , "
+                    "_configuration data:{}"
+                    .format(self._name(), self._configuration_data(),
+                            level=hookenv.DEBUG))
+                count_available += 1
+                available = True
+            else:
+                available = False
+            # if we've changed state (or just connected)
+            if available != conversation_available:
+                self.set_local(_available=available, scope=conversation.scope)
+                count_changed += 1
+
+        # now update the relation states to convey what is happening.
+        count_conversations = len(self.conversations())
+        if count_changed:
             self.set_state('{relation_name}.changed')
+        if count_available:
+            self.set_state('{relation_name}.available')
+        else:
+            self.remove_state('{relation_name}.available')
+        if not count_conversations:
+            self.remove_state('{relation_name}.connected')
+            self.remove_state('{relation_name}.changed')
 
     def clear_changed(self):
         """Provide a convenient method to clear the .changed relation"""
         self.remove_state('{relation_name}.changed')
 
-    @property
-    def name(self):
-        """Returns a string of the name or None if it doesn't exist"""
-        return self._name()
-
-    @property
-    def authentication_data(self):
-        """Get the authentication data (if it has been set yet) or None"""
-        try:
-            scope = self.conversations()[0].scope
-            data = self.get_local('_authentication_data', default=None,
-                                  scope=scope)
-        except ValueError:
-            return None
-        if data is None:
-            return None
-        return json.loads(data)["data"]
-
-    @authentication_data.setter
-    def authentication_data(self, value):
+    def set_authentication_data(self, value, name=None):
         """Set the authentication data to the plugin charm.  This is to enable
         the plugin to either 'talk' to OpenStack or to provide authentication
         data into the configuraiton sections that it needs to set (the generic
@@ -122,9 +145,10 @@ class ManilaPluginRequires(reactive.RelationBase):
         }
 
         :param value: a dictionary of data to set.
+        :param name: OPTIONAL - target the config at a particular name only
         """
         hookenv.log("ManilaPlugin (principal) Setting authentication data:{}"
-                    .format(value),
+                    " on name:{}".format(value, name),
                     level=hookenv.DEBUG)
         keys = {'username', 'password', 'project_domain_id', 'project_name',
                 'user_domain_id', 'auth_uri', 'auth_url', 'auth_type'}
@@ -138,12 +162,13 @@ class ManilaPluginRequires(reactive.RelationBase):
         # whether it is different, and then set the local & remote only if that
         # is the case.
         for conversation in self.conversations():
-            try:
-                existing_auth_data = self.get_local('_authentication_data',
-                                                    default=None,
-                                                    scope=conversation.scope)
-            except ValueError:
-                existing_auth_data = None
+            conversation_name = self.get_remote('_name', default=None,
+                                                scope=conversation.scope)
+            if name != None and name != conversation:
+                continue
+            existing_auth_data = self.get_local('_authentication_data',
+                                                default=None,
+                                                scope=conversation.scope)
             if existing_auth_data is not None:
                 # see if they are different
                 existing_auth = json.loads(existing_auth_data)["data"]
@@ -158,12 +183,27 @@ class ManilaPluginRequires(reactive.RelationBase):
                             scope=conversation.scope)
 
     @property
-    def configuration_data(self):
+    def names(self):
+        """Response with a list of names of backends where there is
+        configuration data on the interface.
+
+        :returns: list of names from the interfaces which have config data
+        """
+        names = []
+        for conversation in self.conversations():
+            name = self.get_remote('_name', default=None,
+                                   scope=conversation.scope)
+            config = self.get_remote('_configuration_data', default=None,
+                                     scope=conversation.scope)
+            if name and config:
+                names.append(name)
+        return names
+
+    def get_configuration_data(self, name=None):
         """Return the configuration_data from the plugin if it is available.
 
         The format of the data returned is:
         {
-            "complete": <boolean>,
             '<config file>': {
                 '<section>: (
                     (key, value),
@@ -172,11 +212,26 @@ class ManilaPluginRequires(reactive.RelationBase):
             )
         }
 
+        if 'name' is provided, then only the configuration data for that name
+        is returned, otherwise all of the configuration data for all
+        conversations is returned as an amalgamated dict.
+
+        :param name: OPTIONAL: specify the name of the interface (_name)
         :returns: data object that was passed.
         """
-        data = self._configuration_data()
-        if data is None:
-            return
-        hookenv.log("ManilaPlugin (principal): have configuration_data: {}"
-                    .format(data), level=hookenv.DEBUG)
-        return json.loads(data)["data"]
+        hookenv.log(">>>> get_configuration_data", level=hookenv.DEBUG)
+        result = {}
+        for conversation in self.conversations():
+            if name:
+                _name = self.get_remote('_name', default=None,
+                                        scope=conversation.scope)
+                if _name != name:
+                    continue
+            config = self.get_remote('_configuration_data', default=None,
+                                     scope=conversation.scope)
+            if config:
+                result.update(json.loads(config)["data"])
+                hookenv.log(
+                    "ManilaPlugin (principal): have configuration_data: {}"
+                    .format(config), level=hookenv.DEBUG)
+        return result
